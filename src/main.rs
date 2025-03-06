@@ -1,10 +1,12 @@
 use clap::Parser;
 use libc::{
-    mmap, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, _SC_PAGESIZE,
+    mmap, mprotect, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE,
+    _SC_PAGESIZE,
 };
-use std::ptr;
+use std::{ffi::c_void, ptr};
 
 const GB: usize = 1024 * 1024 * 1024;
+const DUMP_SMAPS: bool = false;
 
 #[derive(Parser)]
 #[command(
@@ -15,7 +17,7 @@ const GB: usize = 1024 * 1024 * 1024;
 pub struct MincorePerfArgs {
     #[arg(short, long, value_name = "REGION_SIZE", default_value = "1")]
     pub region_size: Option<i32>,
-    #[arg(short, long, default_value = "25", value_name = "PERCENT_PAGES")]
+    #[arg(short, long, default_value = "50", value_name = "PERCENT_PAGES")]
     pub percentage_pages: Option<i32>,
 }
 
@@ -29,6 +31,24 @@ fn main() {
     let percentage_pages = args.percentage_pages.unwrap();
 
     let num_pages = region_size / page_size;
+
+    let smaps = |title: &str| {
+        if DUMP_SMAPS {
+            let pid = std::process::id();
+            println!(
+                "XXX {title}:\n{}",
+                String::from_utf8_lossy(
+                    &std::process::Command::new("cat")
+                        .arg(format!("/proc/{pid}/smaps"))
+                        .output()
+                        .unwrap()
+                        .stdout
+                )
+            )
+        }
+    };
+
+    smaps("before");
 
     // Allocate `region_size` anonymous memory.
     let addr = unsafe {
@@ -47,17 +67,36 @@ fn main() {
         return;
     }
 
+    smaps("after mmap");
+
     // Based on the percentage of pages to touch,
     // calculate how many pages to skip when touching from the region size.
     let skip_pages = num_pages / (num_pages / (100 / (percentage_pages)) as usize) as usize;
 
     // Touch pages.
     for i in (0..num_pages).step_by(skip_pages) {
+        // println!("XXX addr:{:?}", unsafe {
+        //     (addr as *mut u8).add(i * page_size)
+        // });
         unsafe {
             // Write to the page to make it dirty.
             *(addr as *mut u8).add(i * page_size) = 131;
         }
+        let addr = unsafe {
+            mprotect(
+                (addr as *mut u8).add(i * page_size) as *mut c_void,
+                page_size,
+                PROT_READ,
+            )
+        };
+
+        if addr != 0 {
+            eprintln!("Failed to mprotect page.");
+            return;
+        }
     }
+
+    smaps("after touches");
 
     // Use mincore to check if pages are present in memory.
     // This will count accessed and dirty pages.
@@ -69,7 +108,8 @@ fn main() {
     // Get start time.
     let start = std::time::Instant::now();
     // Run mincore 100 times.
-    for _ in 0..100 {
+    let runs = 100;
+    for _ in 0..runs {
         unsafe {
             // Call mincore for the whole region and gather results.
             let res = libc::mincore(addr, region_size, vec.as_mut_ptr());
@@ -80,9 +120,15 @@ fn main() {
         }
     }
 
-    // Print time taken in nanoseconds.
-    println!("Time taken: {:?}", start.elapsed().as_nanos() / 100);
-    //println!("Present pages: {}", present_count);
+    println!(
+        "One mincore for {}GiB ({percentage_pages}%) takes {:.3}s",
+        (region_size as f32 / 1024.0 / 1024.0 / 1024.0 * 1000.0).round() / 1000.0,
+        start.elapsed().as_secs_f32() / runs as f32,
+    );
+    println!(
+        "Present pages: {} num_pages:{num_pages} skip_pages:{skip_pages}",
+        present_count
+    );
 
     // Due to rounding errors, the present count may be off by 1.
     assert!(present_count.abs_diff(num_pages / skip_pages) < 2);
